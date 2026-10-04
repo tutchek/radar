@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<!-- Kostra každé stránky Legislativního radaru (string.Template: $titulek, $nav, $prepinac, $obsah). -->
+<html lang="cs"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$titulek – Legislativní radar</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/static/styl.css?v=$verze">
+</head>
+<body><header>
+<a class="logo" href="/" title="Legislativní radar – ODOK, e-Legislativa a Sněmovna na jednom místě"><span class="znak">§</span> Legislativní radar</a>
+<nav>$nav</nav>
+$prepinac
+<form action="/hledej"><input type="search" name="q" placeholder="PID, naše čj, číslo tisku, OVA čj nebo text…" required>
+<button>Hledat</button></form>
+<a class="tlacitko" href="/obnov" title="Stáhnout čerstvá data (ignoruje 2h cache)">Obnovit data</a>
+</header>
+<main>$obsah</main>
+<script src="/static/skript.js?v=$verze"></script>
+</body></html>

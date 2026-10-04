@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+# výstupy analyzátorů a pomocných skriptů
+*_analyza.txt
+esel_vazby.txt
+vysledky_*.csv
+# zámek Excelu při otevřeném seznamu výrazů
+~$*.xlsx
+# vlastní seznam výrazů pro analýzu relevance (v repozitáři je jen vzor)
+relevance_pravidla.xlsx
