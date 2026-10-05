@@ -44,7 +44,7 @@ from collections import defaultdict
 
 from odok import Stahovani, OdokChyba, bez_diakritiky
 
-__version__ = "1.5"  # 1.1: úpravy podle skutečných dat (stavy, druhy, OVA čj)
+__version__ = "1.8"  # 1.1: úpravy podle skutečných dat (stavy, druhy, OVA čj)
 __all__ = ["Psp", "Tisk", "Krok", "BodSchuze", "PspChyba", "NAZVY_ETAP"]
 
 
@@ -62,6 +62,16 @@ URL_TISK_TEXT = "https://www.psp.cz/sqw/text/tiskt.sqw?O={o}&CT={ct}&CT1={ct1}" 
 URL_SCHUZE = "https://www.psp.cz/sqw/ischuze.sqw?o={o}&s={schuze}"
 URL_HLASOVANI = "https://www.psp.cz/sqw/hlasy.sqw?g={id}"
 URL_ODOK = "https://www.odok.gov.cz/portal/veklep/material/{pid}/"
+# detail senátního tisku na senat.cz (value = id senátního tisku z se_tisk)
+URL_SENAT_TISK = "https://www.senat.cz/xqw/xervlet/pssenat/historie?action=detail&value={id}"
+
+# Senát (archiv se_tisk.zip – Sněmovna ho přebírá ze Senátu jednou denně)
+TYPY_VAZBY_SENAT = {5: "vrácený senátní návrh k dopracování", 10: "senátní návrh zákona projednávaný ve Sněmovně",
+                    20: "postoupeno Senátu", 21: "opakovaně postoupeno Senátu",
+                    30: "souběžné projednávání (např. mezinárodní smlouva)"}
+# stavy senátního tisku – podle dat (5 = naprostá většina starých tisků, 2 = právě projednávané);
+# číselník stavů ve zveřejněných datech není
+STAVY_SENAT = {1: "doručen", 2: "projednává se", 5: "uzavřen"}
 
 # Typy sloupců: i = celé číslo, s = text, d = datum, t = datum a čas
 _I, _S, _D, _T = "i", "s", "d", "t"
@@ -92,6 +102,10 @@ SCHEMA = {
     "hist_vybory": ("tisky", [("id_tisku", _I), ("id_organ", _I), ("typ", _I), ("id_hist", _I),
                               ("id_posl", _I), ("poradi", _I), ("garancni", _I)]),
     "vysledek": ("tisky", [("id_vysledek", _I), ("druh_vysledek", _S)]),
+    "se_tisk": ("se_tisk", [("id_tisk", _I), ("id_druh", _I), ("id_stav", _I), ("cislo_tisku", _I),
+                            ("id_obdobi", _I), ("anotace", _S), ("nazev_tisku", _S)]),
+    "se_druh_tisku": ("se_tisk", [("id_druh", _I), ("nazev_druhu", _S)]),
+    "psp2senat": ("se_tisk", [("id_psp", _I), ("id_senat", _I), ("typ", _I)]),
     "tisky_za": ("tisky", [("id_tisk", _I), ("cislo_za", _I), ("id_hist", _I), ("id_druh", _I),
                            ("nazev_za", _S), ("uplny_nazev_za", _S), ("rozeslano", _T),
                            ("id_org", _I), ("usn_vybor", _I), ("id_posl", _I), ("t_url", _S),
@@ -158,6 +172,55 @@ ETAPA_PODLE_TYPU = {typ: nazev for nazev, typy in ETAPY for typ in typy}
 NAZVY_ETAP = [nazev for nazev, _ in ETAPY]
 TYP_VYBORU = {1: "navrženo", 2: "přikázáno", 3: "iniciativně"}
 TYP_STAVU_PROJEDNANO = 6          # typ_stavu 6 = „KONEC“ → projednávání skončilo
+TYP_STAVU_SENAT = 12            # typ_stavu „Senát“ – do něj tisk přejde doručením Senátu
+TYP_STAVU_ODESILANO_SENATU = 64
+LHUTA_SENATU_DNI = 30           # čl. 46 Ústavy – Senát se usnese do 30 dnů od doručení
+
+
+def _velikonocni_nedele(rok):
+    """Datum Velikonoční neděle (gregoriánský kalendář, anonymní algoritmus)."""
+    a, b, c = rok % 19, rok // 100, rok % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    mesic = (h + l - 7 * m + 114) // 31
+    den = (h + l - 7 * m + 114) % 31 + 1
+    return _dt.date(rok, mesic, den)
+
+
+def svatky(rok):
+    """Státní svátky a ostatní svátky ČR (dny pracovního klidu) v daném roce."""
+    pevne = [(1, 1), (5, 1), (5, 8), (7, 5), (7, 6), (9, 28), (10, 28), (11, 17), (12, 24), (12, 25), (12, 26)]
+    vysledek = {_dt.date(rok, m, d) for m, d in pevne}
+    nedele = _velikonocni_nedele(rok)
+    vysledek.add(nedele + _dt.timedelta(days=1))          # Velikonoční pondělí
+    if rok >= 2016:
+        vysledek.add(nedele - _dt.timedelta(days=2))      # Velký pátek
+    return vysledek
+
+
+def je_pracovni_den(d):
+    return d.weekday() < 5 and d not in svatky(d.year)
+
+
+def konec_lhuty(zacatek, dni):
+    """Konec lhůty v kalendářních dnech: počítá se od následujícího dne po události;
+    připadne-li konec na sobotu, neděli nebo svátek, je jím nejbližší následující pracovní den."""
+    if zacatek is None:
+        return None
+    if isinstance(zacatek, _dt.datetime):
+        zacatek = zacatek.date()
+    konec = zacatek + _dt.timedelta(days=dni)
+    while not je_pracovni_den(konec):
+        konec += _dt.timedelta(days=1)
+    return konec
+
+
+VOLITELNE_ARCHIVY = {"poslanci", "se_tisk"}   # bez nich aplikace běží (jen bez jmen / bez Senátu)
 DRUHY_ZAKONU = {1: "vládní návrh zákona", 2: "návrh zákona (nevládní)", 3: "státní rozpočet"}
 DRUHY_VLADNI = (1, 3)
 DRUHY_EU = (41, 45, 46, 47)       # k číslu tisku se přidává "-E"
@@ -408,7 +471,10 @@ class Psp(Stahovani):
     def obnov(self):
         """Vynutí stažení čerstvých archivů a zahodí načtená data."""
         for archiv in {a for a, _ in SCHEMA.values()}:
-            self._archiv(archiv, vynutit=True)
+            if archiv in VOLITELNE_ARCHIVY:
+                self._bezpecne(lambda: self._archiv(archiv, vynutit=True))
+            else:
+                self._archiv(archiv, vynutit=True)
         self._tabulky.clear()
         self._indexy.clear()
         self._obdobi = None
@@ -456,6 +522,15 @@ class Psp(Stahovani):
         return d.get("nazev_druh") if d else None
 
     # ---------------- volební období ----------------
+
+    @property
+    def posledni_obdobi(self):
+        """Číslo aktuálního (nejnovějšího) volebního období PS, např. 10."""
+        klic = "__posledni_obdobi"
+        if klic not in self._indexy:       # indexy sdílí i pohledy v_obdobi
+            seznam = self.obdobi_seznam()
+            self._indexy[klic] = seznam[0].cislo if seznam else None
+        return self._indexy[klic]
 
     def obdobi_seznam(self):
         """Všechna volební období PS (podle orgánů PSPn), od nejnovějšího."""
@@ -912,8 +987,26 @@ class Tisk:
     # --- stav ---
     @property
     def stav(self):
-        """Popis aktuálního stavu projednávání."""
+        """Popis aktuálního stavu projednávání (u tisků z minulých období, které nebyly
+        dokončeny: projednávání skončilo koncem volebního období)."""
+        if self.zanikl_koncem_obdobi:
+            return "ukončeno koncem volebního období"
+        return self.stav_v_datech
+
+    @property
+    def stav_v_datech(self):
+        """Stav tak, jak je uveden v datech Sněmovny."""
         return self._psp._popis_stavu(self.data.get("id_stav"))
+
+    @property
+    def zanikl_koncem_obdobi(self):
+        """Tisk z minulého volebního období, jehož projednávání nebylo dokončeno –
+        koncem období se už nedoprojednává, i když v datech zůstal „rozpracovaný“."""
+        s = self._psp._stav(self.data.get("id_stav")) or {}
+        if s.get("id_typ") == TYP_STAVU_PROJEDNANO or self.revokovano:
+            return False
+        posledni = self._psp.posledni_obdobi
+        return bool(self.obdobi and posledni and self.obdobi < posledni)
 
     @property
     def lhuta(self):
@@ -922,8 +1015,9 @@ class Tisk:
 
     @property
     def projednano(self):
+        """Projednávání skončilo (stav KONEC, nebo tisk zanikl koncem volebního období)."""
         s = self._psp._stav(self.data.get("id_stav")) or {}
-        return s.get("id_typ") == TYP_STAVU_PROJEDNANO
+        return s.get("id_typ") == TYP_STAVU_PROJEDNANO or self.zanikl_koncem_obdobi
 
     @property
     def revokovano(self):
@@ -968,10 +1062,55 @@ class Tisk:
                                                          "probiha": False})
                 e["do"], e["akce"] = k.datum, k.akce
         aktualni = self.posledni_krok.etapa if self.posledni_krok else None
-        if aktualni in vysledek and vysledek[aktualni]["do"] is None:
+        if aktualni in vysledek and vysledek[aktualni]["do"] is None and not self.zanikl_koncem_obdobi:
             vysledek[aktualni]["probiha"] = True
         self._zpresni_garancni_vybor(vysledek)
+        senat = self.lhuta_senatu()
+        if senat and "Senát" in vysledek:
+            if senat["doruceno"]:
+                vysledek["Senát"]["od"] = senat["doruceno"]    # Senát začíná doručením (ne odesláním)
+            vysledek["Senát"]["lhuta"] = senat
         return {n: vysledek[n] for n in NAZVY_ETAP if n in vysledek}
+
+    def lhuta_senatu(self, dnes=None):
+        """
+        Projednávání v Senátu (poslední postoupení): {'odeslano', 'doruceno', 'lhuta_do',
+        'rozhodnuto', 'akce', 'zbyva_dni', 'uplynula'} nebo None, pokud tisk Senátu nešel.
+          doruceno  – den doručení Senátu (přechod do stavu „Senát“), od něj běží 30denní lhůta
+          lhuta_do  – poslední den lhůty (posun z víkendu/svátku na nejbližší pracovní den)
+          rozhodnuto / akce – kdy a jak Senát tisk opustil (None, dokud v Senátu je)
+        """
+        kroky = self.historie()
+        odeslani = [k for k in kroky if k.typ_kam == TYP_STAVU_ODESILANO_SENATU
+                    and k.typ_odkud != TYP_STAVU_ODESILANO_SENATU]
+        doruceni = [k for k in kroky if k.typ_kam == TYP_STAVU_SENAT and k.typ_odkud != TYP_STAVU_SENAT]
+        if not odeslani and not doruceni:
+            return None
+        d = doruceni[-1] if doruceni else None
+        o = odeslani[-1] if odeslani else None
+        if o is not None and d is not None and (kroky.index(o) > kroky.index(d)):
+            d = None                                   # znovu odesláno, zatím nedoručeno
+        if d is not None and _jako_datetime(d.datum) is None:
+            d = None                                   # krok bez data – lhůtu nelze spočítat
+        vysledek = {"odeslano": o.datum if o else None, "doruceno": d.datum if d else None,
+                    "lhuta_do": None, "rozhodnuto": None, "akce": None, "zbyva_dni": None,
+                    "uplynula": False}
+        if d is None:
+            return vysledek
+        vysledek["lhuta_do"] = konec_lhuty(_jako_datetime(d.datum), LHUTA_SENATU_DNI)
+        if vysledek["lhuta_do"] is None:
+            return vysledek
+        po = kroky[kroky.index(d) + 1:]
+        konec = next((k for k in po if k.typ_odkud == TYP_STAVU_SENAT and k.typ_kam != TYP_STAVU_SENAT), None)
+        if konec is not None:
+            vysledek["rozhodnuto"], vysledek["akce"] = konec.datum, konec.akce
+        elif self.zanikl_koncem_obdobi:
+            vysledek["zaniklo"] = True
+        else:
+            dnes = dnes or _dt.date.today()
+            vysledek["zbyva_dni"] = (vysledek["lhuta_do"] - dnes).days
+            vysledek["uplynula"] = vysledek["zbyva_dni"] < 0
+        return vysledek
 
     def usneseni_garancniho_vyboru(self):
         """
@@ -1092,10 +1231,41 @@ class Tisk:
             })
         return vysledek
 
+    def senatni_tisky(self):
+        """Senátní tisky navázané na tento sněmovní tisk (psp2senat, se_tisk.zip):
+        [{'id','cislo','obdobi','stav','stav_nazev','druh','anotace','nazev','typ','typ_popis','url'}]."""
+        p = self._psp
+        vazby = p._bezpecne(lambda: p._index("psp2senat", "id_psp").get(self.id_tisk, []), [])
+        vysledek = []
+        for v in vazby:
+            st = p._bezpecne(lambda: p._jeden("se_tisk", "id_tisk", v.get("id_senat")))
+            if not st:
+                continue
+            druh = p._bezpecne(lambda: p._jeden("se_druh_tisku", "id_druh", st.get("id_druh"))) or {}
+            cislo, obdobi = st.get("cislo_tisku"), st.get("id_obdobi")
+            if obdobi == 1 and isinstance(cislo, int) and cislo >= 1000:   # 1. období: RRTTT = R/T
+                cislo_text = "%d/%d" % (cislo // 1000, cislo % 1000)
+            else:
+                cislo_text = str(cislo) if cislo is not None else ""
+            vysledek.append({
+                "id": st.get("id_tisk"), "cislo": cislo_text, "obdobi": obdobi,
+                "stav": st.get("id_stav"),
+                "stav_nazev": STAVY_SENAT.get(st.get("id_stav"), "stav %s" % st.get("id_stav")),
+                "druh": druh.get("nazev_druhu"), "anotace": st.get("anotace"), "nazev": st.get("nazev_tisku"),
+                "typ": v.get("typ"), "typ_popis": TYPY_VAZBY_SENAT.get(v.get("typ"), "vazba %s" % v.get("typ")),
+                "url": URL_SENAT_TISK.format(id=st.get("id_tisk")),
+            })
+        return sorted(vysledek, key=lambda x: (x["obdobi"] or 0, x["id"] or 0))
+
     def nasledne_tisky(self):
         """Následné tisky (usnesení výborů, pozměňovací návrhy, stanovisko vlády …)."""
         radky = self._psp._index("tisky_za", "id_tisk").get(self.id_tisk, [])
-        vysledek = []
+        vysledek = [{                                   # samotný tisk („/0“) – text předloženého návrhu
+            "cislo": "%s/0" % self.ct, "druh": self.druh, "nazev": self.uplny_nazev or self.nazev,
+            "rozeslano": self.rozeslano, "organ": None, "vysledek": "výchozí tisk",
+            "url": self.url_text or (URL_TISK_TEXT.format(o=self.obdobi, ct=self.ct, ct1=0)
+                                     if self.obdobi else None),
+        }]
         for r in sorted(radky, key=lambda r: (r.get("sort_it") or 0, r.get("cislo_za") or 0)):
             vysl = self._psp._jeden("vysledek", "id_vysledek", r.get("id_vysledek")) or {}
             post = "abcdefghij"[r["cislo_za_post"] - 1] if isinstance(r.get("cislo_za_post"), int) \

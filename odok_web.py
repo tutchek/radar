@@ -47,6 +47,7 @@ a účinnost; primární zůstávají data ODOK.
 """
 
 import datetime as _dt
+from collections import Counter
 import html
 import json
 import http.cookies
@@ -103,6 +104,9 @@ NAZEV_APLIKACE = "Legislativní radar"
 
 # volební období PS pro výběr v liště, dokud se nenačtou data Sněmovny: číslo → (rok od, rok do)
 ZNAMA_OBDOBI = {10: (2025, None), 9: (2021, 2025), 8: (2017, 2021), 7: (2013, 2017)}
+# začátky období (volby do PS) pro přesné hranice, než se načtou data Sněmovny
+ZACATKY_OBDOBI = {10: _dt.date(2025, 10, 4), 9: _dt.date(2021, 10, 9), 8: _dt.date(2017, 10, 21),
+                  7: _dt.date(2013, 10, 26), 6: _dt.date(2010, 5, 29)}
 PRVNI_ROK_ODOK = 2016      # nejstarší ročník datasetu ODOK nabízený ve výběru
 
 
@@ -340,6 +344,10 @@ def odkazy_esel(n, text=None, kratce=False):
     return hlavni
 
 
+def _jako_den(d):
+    return d.date() if isinstance(d, _dt.datetime) else d
+
+
 def odkaz_sbirka(text):
     """'526/1990 Sb.' → odkaz do e-Sbírky; jiný text jen escapovaný."""
     if not text:
@@ -394,6 +402,10 @@ class OdokServer:
         self._psp_hotovo = threading.Event()
         self._psp_chyba = None
         self._pid_tisk = {}                  # PID eKLEPu → id_tisk
+        # index čísel jednacích připomínek (norm. čj → [{pid, cj, org, typ}])
+        self._zamek_indexu = threading.Lock()
+        self._index_cj = {}
+        self._index_pid = set()
         # e-Legislativa (esel.py) – kontext k podzákonným předpisům, načítá se na pozadí
         self.esel = None
         self._zamek_esel = threading.Lock()
@@ -457,6 +469,7 @@ class OdokServer:
         if not self._esel_hotovo.is_set():
             self.nacti_esel_na_pozadi()
         threading.Thread(target=self._hlidej_stari_dat, daemon=True).start()
+        self.indexuj_pripominky_na_pozadi()
         print("%s běží na %s%s" % (NAZEV_APLIKACE, self.url, "" if na_pozadi else "  (ukončení: Ctrl+C)"))
         if otevrit_prohlizec:
             threading.Timer(0.5, webbrowser.open, args=(self.url,)).start()
@@ -575,6 +588,59 @@ class OdokServer:
             if c == cislo:
                 return roky_obdobi(od, do)
         return [_dt.date.today().year]
+
+    def _rozsah_vyberu(self):
+        """(od, do, popis) – dny, do kterých musí spadat založení materiálu podle výběru v liště;
+        None = bez omezení (všechna období). do=None → dosud."""
+        rok, cislo = self._vybrany_rok(), self._cislo_obdobi()
+        if cislo == "vse":
+            return (_dt.date(rok, 1, 1), _dt.date(rok, 12, 31), "rok %d" % rok) if rok else None
+        od = do = None
+        if _psp is not None and self.psp is not None and self._psp_hotovo.is_set() and not self._psp_chyba:
+            try:
+                o = next((x for x in self.psp.obdobi_seznam() if x.cislo == cislo), None)
+                if o is not None and o.od:
+                    od, do = o.od.date(), (o.do.date() if o.do else None)
+            except OdokChyba:
+                pass
+        if od is None:
+            od = ZACATKY_OBDOBI.get(cislo)
+            dalsi = ZACATKY_OBDOBI.get(cislo + 1) if isinstance(cislo, int) else None
+            do = dalsi - _dt.timedelta(days=1) if dalsi else None
+        if od is None:
+            return None
+        popis = "%s. VO (%s – %s)" % (cislo, fmt_datum(od), fmt_datum(do) if do else "dosud")
+        if rok:
+            od, do = max(od, _dt.date(rok, 1, 1)), min(do or _dt.date(rok, 12, 31), _dt.date(rok, 12, 31))
+            popis = "rok %d v %s. VO (%s – %s)" % (rok, cislo, fmt_datum(od), fmt_datum(do))
+        return od, do, popis
+
+    @staticmethod
+    def _datum_materialu(m):
+        d = m.datum_vytvoreni or m.datum_autorizace
+        return d.date() if d else None
+
+    def _filtr_vyberu(self, materialy):
+        """(vybrané materiály, počet skrytých, rozsah) – jen materiály založené ve zvoleném období.
+        Ročníky ODOK jsou po kalendářních letech, období začínají v říjnu – bez filtru by se míchala."""
+        rozsah = self._rozsah_vyberu()
+        if rozsah is None:
+            return list(materialy), 0, None
+        od, do, _popis = rozsah
+        vybrane = []
+        for m in materialy:
+            d = self._datum_materialu(m)
+            if d is None or (d >= od and (do is None or d <= do)):
+                vybrane.append(m)
+        return vybrane, len(materialy) - len(vybrane), rozsah
+
+    @staticmethod
+    def _poznamka_filtru(skryto, rozsah):
+        if not rozsah:
+            return ""
+        return ("<p class='tlumene'>Zobrazeny materiály založené v období %s%s.</p>" % (
+            e(rozsah[2]), "; skryto %d založených mimo toto období (ročníky ODOK jsou po kalendářních "
+                          "letech, volební období začínají v říjnu)" % skryto if skryto else ""))
 
     def _popis_vyberu(self):
         rok, cislo = self._vybrany_rok(), self._cislo_obdobi()
@@ -699,8 +765,17 @@ class OdokServer:
     def stranka_uvod(self, parametry):
         odok = self._odok_pro()
         with self._zamek_dat:
-            predkladatele = odok.predkladatele_souhrn()
-            celkem = len(odok)
+            materialy, skryto, rozsah = self._filtr_vyberu(odok.materialy())
+        podle = {}
+        for m in materialy:
+            podle.setdefault(m.predkladatel_zkratka or "?", Counter())[m.predkladatel or "(neuvedeno)"] += 1
+        predkladatele = []
+        for zkratka, nazvy in podle.items():
+            uvedene = [n for n, _c in nazvy.most_common() if n != "(neuvedeno)"]
+            predkladatele.append((zkratka, uvedene[0] if uvedene else "(neuvedeno)",
+                                  sum(nazvy.values()), uvedene[1:]))
+        predkladatele.sort(key=lambda x: (-x[2], x[0]))
+        celkem = len(materialy)
         dlazdice = "".join(
             "<a href='%s'%s><span class='zkratka'>%s</span><span>%s</span>"
             "<span class='pocet'>%d</span></a>" % (
@@ -709,18 +784,20 @@ class OdokServer:
                 e(zkratka), e(nazev), pocet)
             for zkratka, nazev, pocet, dalsi in predkladatele)
         obsah = """<h1>Předkladatelé</h1>
-<p class="tlumene">%d materiálů v datasetu (roky %s). Klikněte na předkladatele
-nebo zadejte PID / čj do vyhledávání nahoře.</p>
-<div class="mrizka">%s</div>""" % (celkem, e(", ".join(map(str, odok.roky))), dlazdice)
+<p class="tlumene">%d materiálů (%s, ročníky ODOK %s). Klikněte na předkladatele
+nebo zadejte PID / čj do vyhledávání nahoře.</p>%s
+<div class="mrizka">%s</div>""" % (celkem, e(rozsah[2] if rozsah else "všechna období"),
+                                   e(", ".join(map(str, odok.roky))),
+                                   self._poznamka_filtru(skryto, rozsah) if skryto else "", dlazdice)
         return self._stranka("Předkladatelé", obsah)
 
     def stranka_ministerstvo(self, parametry):
         zkratka = parametry.get("z", "")
         with self._zamek_dat:
-            materialy = self._odok_pro().materialy_ministerstva(zkratka)
-        nazev = materialy[0].predkladatel if materialy else ""
-        obsah = "<h1>%s <span class='tlumene'>%s</span></h1>%s" % (
-            e(zkratka), e(nazev),
+            materialy, skryto, rozsah = self._filtr_vyberu(self._odok_pro().materialy_ministerstva(zkratka))
+        nazev = next((m.predkladatel for m in materialy if m.predkladatel), "")
+        obsah = "<h1>%s <span class='tlumene'>%s</span></h1>%s%s" % (
+            e(zkratka), e(nazev), self._poznamka_filtru(skryto, rozsah),
             self._tabulka_materialu(materialy) if materialy else
             "<p>Žádné materiály pro „%s“.</p>" % e(zkratka))
         return self._stranka(zkratka, obsah)
@@ -730,6 +807,10 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
         if not q:
             return self._presmeruj("/")
         poznamka_tisk = ""
+        # čj připomínky (např. kolegů k cizímu návrhu) → rovnou materiál, ke kterému patří
+        nalezy = self.hledej_cj_pripominek(q, jen_presne=True)
+        if len({n["pid"] for n in nalezy}) == 1:
+            return self._presmeruj(odkaz("/material", id=nalezy[0]["pid"]))
         if _psp is not None and re.fullmatch(r"(OVA\s*)?\d+\s*(-\s*E)?(\s*/\s*\d+)?", q, re.I):
             # „123/26“ / „OVA 123/26“ je nejčastěji čj ÚV materiálu → nejdřív ODOK, pak Sněmovna
             if "/" in q:
@@ -762,16 +843,20 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
             except OdokChyba:
                 pass
             vysledky = odok.hledej(q)
+            skryto, rozsah = 0, None
+            if not vse:
+                vysledky, skryto, rozsah = self._filtr_vyberu(vysledky)
             roky_text = "%d–%d" % (min(odok.roky), max(odok.roky)) if len(odok.roky) > 1 \
                 else str(odok.roky[0])
         orez = len(vysledky) > MAX_VYSLEDKU
-        rozsah = ("<p class='tlumene'>Hledáno ve všech ročnících ODOK (%s).</p>" % roky_text if vse else
+        rozsah_html = ("<p class='tlumene'>Hledáno ve všech ročnících ODOK (%s).</p>" % roky_text if vse else
                   "<div class='lista'><span class='tlumene'>Hledáno: %s (ODOK %s).</span>"
                   "<a class='tlacitko' href='%s'>Hledat ve všech letech %d–%d</a></div>" % (
                       e(self._popis_vyberu()), e(roky_text), e(odkaz("/hledej", q=q, vse="1")),
                       PRVNI_ROK_ODOK, _dt.date.today().year))
-        obsah = "<h1>Hledání: „%s“</h1>%s%s%s%s" % (
-            e(q), poznamka_tisk, rozsah,
+        obsah = "<h1>Hledání: „%s“</h1>%s%s%s%s%s%s" % (
+            e(q), poznamka_tisk, self._html_nalezy_pripominek(q), rozsah_html,
+            self._poznamka_filtru(skryto, rozsah) if skryto else "",
             "<p class='tlumene'>Zobrazeno prvních %d z %d.</p>" % (MAX_VYSLEDKU, len(vysledky))
             if orez else "",
             self._tabulka_materialu(vysledky[:MAX_VYSLEDKU]) if vysledky else
@@ -813,7 +898,8 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
             for k, v in info.items() if v is not None)
 
         def tlacitko_relevance(d, u):
-            return self._tlacitko_relevance(pid, d, u)
+            return " ".join(x for x in (self._tlacitko_nahled(pid, d, u),
+                                        self._tlacitko_relevance(pid, d, u)) if x)
 
         pid = m.pid or ""
         if dokumenty:
@@ -828,7 +914,7 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
                 for d, u in zip(dokumenty, url_dok))
             tab_dok = """<div class="posun"><table class="data raditelna"><thead><tr>
 <th>#</th><th>Typ</th><th>Původní název</th><th>Soubor</th><th>Velikost</th><th>Změněno</th>
-<th>Relevance</th></tr></thead><tbody>%s</tbody></table></div>""" % radky_dok
+<th>Obsah</th></tr></thead><tbody>%s</tbody></table></div>""" % radky_dok
             if not any(url_dok):
                 tab_dok += ("<p class='tlumene'>Soubory stáhnete na <a href='%s' target='_blank' "
                             "rel='noopener'>stránce materiálu v ODOK</a> (přímý odkaz na dokument "
@@ -878,13 +964,17 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
             return self.cast_esel_k_materialu(pid)
         if typ == "relevance":
             return self.cast_relevance(pid, parametry.get("d", ""))
+        if typ == "nahled":
+            return self.cast_nahled(pid, parametry.get("d", ""))
         if typ == "plpv":
             return self.cast_plpv(parametry)
         with self._zamek_dat:
             if typ == "verze":
                 return self._html_verze(pid, self.odok.verze(pid))
             elif typ == "pripominky":
-                return self._html_pripominky(self.odok.pripominky(pid))
+                data = self.odok.pripominky(pid)
+                self._pridej_do_indexu(pid.upper(), data)
+                return self._html_pripominky(data, pid)
             else:
                 raise ValueError("Neznámý typ: %s" % typ)
         return json_na_html(data)
@@ -895,9 +985,20 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
         if self.relevance is None or not url or not d.get("pid") or not pid_materialu or \
                 not re.search(r"\.(doc[xm]?|pdf)\b", nazvy):
             return ""
-        return ("<button type='button' class='tlacitko-mini' data-relevance='%s' title='Stáhne "
-                "dokument a vyhledá v něm výrazy ze seznamu útvarů'>Provést analýzu relevance</button>"
+        return ("<button type='button' class='tlacitko-mini' data-vlozit='%s' data-skryt='Skrýt analýzu' "
+                "data-nacitam='Stahuji dokument a hledám výrazy…' title='Stáhne dokument a vyhledá v něm "
+                "výrazy ze seznamu útvarů'>Provést analýzu relevance</button>"
                 % e(odkaz("/cast", typ="relevance", pid=pid_materialu, d=d["pid"])))
+
+    def _tlacitko_nahled(self, pid_materialu, d, url):
+        """Tlačítko pro zobrazení obsahu dokumentu přímo na stránce (.docx, .doc, PDF)."""
+        nazvy = " ".join(str(d.get(k) or "") for k in ("name", "old_name")).lower()
+        if _relevance is None or not url or not d.get("pid") or not pid_materialu or \
+                not re.search(r"\.(doc[xm]?|pdf)\b", nazvy):
+            return ""
+        return ("<button type='button' class='tlacitko-mini' data-vlozit='%s' data-skryt='Skrýt text' "
+                "data-nacitam='Stahuji a načítám dokument…' title='Zobrazí obsah dokumentu přímo na "
+                "stránce'>Zobrazit text</button>" % e(odkaz("/cast", typ="nahled", pid=pid_materialu, d=d["pid"])))
 
     # typy verzí materiálu v pořadí legislativního procesu
     TYPY_VERZI = {"MPR": "Verze do připomínkového řízení", "PK": "Verze pro jednání pracovních komisí",
@@ -945,10 +1046,11 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
                         e(a.get("uri") or _odok.URL_DOKUMENT.format(pid=a.get("pid", ""))),
                         e(a.get("old_name") or a.get("name") or "soubor"), e(a.get("name") or ""),
                         e(a.get("size_str") or ""),
-                        self._tlacitko_relevance(pid, a, a.get("uri") or a.get("pid")))
+                        " ".join(x for x in (self._tlacitko_nahled(pid, a, a.get("uri") or a.get("pid")),
+                                             self._tlacitko_relevance(pid, a, a.get("uri") or a.get("pid"))) if x))
                     for a in prilohy)
                 tab = ("<div class='posun'><table class='data raditelna'><thead><tr><th>#</th><th>Typ</th>"
-                       "<th>Původní název</th><th>Soubor</th><th>Velikost</th><th>Relevance</th></tr></thead>"
+                       "<th>Původní název</th><th>Soubor</th><th>Velikost</th><th>Obsah</th></tr></thead>"
                        "<tbody>%s</tbody></table></div>" % radky)
             else:
                 tab = "<p class='tlumene'>Bez dokumentů.</p>"
@@ -969,7 +1071,7 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
     TYPY_PRIPOMINEK = {"Z": (0, "zasadni", "Zásadní"), "D": (1, "doporucujici", "Doporučující"),
                        "BP": (2, "bez", "Bez připomínek")}
 
-    def _html_pripominky(self, data):
+    def _html_pripominky(self, data, pid=None):
         """Připomínky z ODOK jako přehled: souhrn, tabulka podle míst, kdo se nevyjádřil."""
         if not isinstance(data, dict):
             return json_na_html(data)
@@ -1016,13 +1118,14 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
             for r in sorted(pripominky, key=poradi):
                 tid, tnazev = typ(r)
                 org = (r.get("author") or {}).get("organization") or {}
-                soubory = "<br>".join(
-                    "<a href='%s' target='_blank' rel='noopener' title='%s'>%s</a> <span class='tlumene'>"
-                    "(%s%s)</span>" % (
+                soubory = "".join(
+                    "<div class='soubor'><a href='%s' target='_blank' rel='noopener' title='%s'>%s</a> "
+                    "<span class='tlumene'>(%s%s)</span> %s</div>" % (
                         e(a.get("uri") or _odok.URL_DOKUMENT.format(pid=a.get("pid", ""))),
                         e(a.get("name") or ""), e(a.get("old_name") or a.get("name") or "soubor"),
                         e((a.get("type") or {}).get("name") or ""),
-                        ", " + e(a["size_str"]) if a.get("size_str") else "")
+                        ", " + e(a["size_str"]) if a.get("size_str") else "",
+                        self._tlacitko_nahled(pid, a, a.get("uri") or a.get("pid")))
                     for a in sorted(r.get("attachments") or [], key=lambda a: a.get("order") or 0))
                 text = " ".join(x for x in (r.get("notes"), r.get("reason")) if x and x.strip())
                 radky.append(
@@ -1068,6 +1171,7 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
             self.nacti_psp_na_pozadi(vynutit=True)
         if _esel is not None:
             self.nacti_esel_na_pozadi(vynutit=True)
+        self.indexuj_pripominky_na_pozadi()
 
     def nacti_odok_na_pozadi(self):
         """Načte dataset ODOK hned po startu (jinak by se načítal až při první stránce)."""
@@ -1158,7 +1262,7 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
                 psp_stav = "načítá se"
             p = self.psp
             if p is not None:
-                for archiv in ("tisky", "schuze", "poslanci"):
+                for archiv in ("tisky", "schuze", "poslanci", "se_tisk"):
                     psp_soubory.append(("Sněmovna %s.zip" % archiv,
                                         self._soubor_info(p._cache_cesta(archiv + ".zip"), p.max_stari_s)))
                 if self._psp_hotovo.is_set() and not self._psp_chyba:
@@ -1185,6 +1289,7 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
                     "tisku_s_eklep": len(self._pid_tisk)},
             "esel": {"stav": esel_stav, "soubory": esel_soubory, "navrhu": navrhu},
             "plpv": sorted("%s %s" % k for k in self._plpv_cache),
+            "pripominky": {"cj": len(self._index_cj), "materialu": len(self._index_pid)},
         }
 
     # ---------------- Sněmovna (psp.py) ----------------
@@ -1212,6 +1317,8 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
                                 "druh_tisku", "typ_zakon", "tisk_eklep", "tz_eklep", "schuze",
                                 "bod_schuze", "bod_stav", "tisky_za", "vysledek"):
                     self.psp.tabulka(tabulka)
+                for tabulka in ("se_tisk", "se_druh_tisku", "psp2senat"):   # Senát je volitelný
+                    self.psp._bezpecne(lambda: self.psp.tabulka(tabulka))
                 _ = self.psp.obdobi
                 mapa = {}
                 for tab in ("tisk_eklep", "tz_eklep"):
@@ -1230,33 +1337,56 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
 
     # ---------------- analýza relevance (relevance.py) ----------------
 
-    def cast_relevance(self, pid, pid_dokumentu):
-        """HTML fragment: pro které útvary je dokument relevantní a proč."""
-        if self.relevance is None:
-            raise OdokChyba("Analýza relevance není k dispozici – vedle odok_web.py chybí relevance.py.")
+    def _dokument(self, pid, pid_dokumentu):
+        """(popis dokumentu, bytes) – dokument materiálu, některé jeho verze nebo připomínky.
+        Dokument se v ODOK nemění → stáhne se jen jednou a pak se bere z %TEMP% (bez ohledu na stáří)."""
         with self._zamek_dat:
             m = self._najdi_material(pid)
             d = next((x for x in m.dokumenty() if x.get("pid") == pid_dokumentu), None)
             url = m.url_dokumentu(d) if d is not None else None
-            if d is None:     # dokument z některé historické verze
+            zdroje = (("verze", "versions_list"), ("pripominky", "reviews_list"))
+            for metoda, klic in zdroje:          # dokument z historické verze nebo z připomínky
+                if d is not None:
+                    break
                 try:
-                    verze = self.odok.verze(pid).get("versions_list") or []
+                    seznam = getattr(self.odok, metoda)(pid).get(klic) or []
                 except (OdokChyba, AttributeError, ValueError):
-                    verze = []
-                d = next((a for v in verze for a in (v.get("attachments") or [])
+                    seznam = []
+                d = next((a for v in seznam for a in (v.get("attachments") or [])
                           if a.get("pid") == pid_dokumentu), None)
                 if d is not None:
                     url = d.get("uri") or _odok.URL_DOKUMENT.format(pid=pid_dokumentu)
             if d is None:
                 raise OdokChyba("Dokument %s u materiálu %s nenalezen." % (pid_dokumentu, pid))
-        # dokument se v ODOK nemění → stáhne se jen jednou a pak se bere z %TEMP% (bez ohledu na stáří)
         nazev_cache = "dokument_%s.docx" % re.sub(r"\W", "", pid_dokumentu)   # formát se pozná z obsahu
         cesta = self.odok._cache_cesta(nazev_cache)
         if os.path.exists(cesta) and os.path.getsize(cesta) > 0:
             with open(cesta, "rb") as f:
-                obsah = f.read()
-        else:
-            obsah = self.odok._ziskej_s_cache(url, nazev_cache, vynutit=True)
+                return d, f.read()
+        return d, self.odok._ziskej_s_cache(url, nazev_cache, vynutit=True)
+
+    def cast_nahled(self, pid, pid_dokumentu):
+        """HTML fragment: obsah dokumentu (Word se strukturou a tabulkami, .doc a PDF jako text)."""
+        if _relevance is None or not hasattr(_relevance, "dokument_na_html"):
+            raise OdokChyba("Náhled není k dispozici – vedle odok_web.py chybí aktuální relevance.py.")
+        d, obsah = self._dokument(pid, pid_dokumentu)
+        try:
+            telo = _relevance.dokument_na_html(obsah)
+        except _relevance.RelevanceChyba as chyba:
+            raise OdokChyba(str(chyba))
+        url = d.get("uri") or _odok.URL_DOKUMENT.format(pid=pid_dokumentu)
+        return ("<div class='nahled'><div class='lista'><b>%s</b><span class='tlumene'>%s</span>"
+                "<a href='%s' target='_blank' rel='noopener'>stáhnout ↗</a>"
+                "</div><div class='nahled-obsah'>%s</div></div>" % (
+                    e(d.get("old_name") or d.get("name") or "dokument"),
+                    e((d.get("type") or {}).get("name") or "") if isinstance(d.get("type"), dict) else "",
+                    e(url), telo or "<p class='tlumene'>Dokument neobsahuje žádný text.</p>"))
+
+    def cast_relevance(self, pid, pid_dokumentu):
+        """HTML fragment: pro které útvary je dokument relevantní a proč."""
+        if self.relevance is None:
+            raise OdokChyba("Analýza relevance není k dispozici – vedle odok_web.py chybí relevance.py.")
+        d, obsah = self._dokument(pid, pid_dokumentu)
         import io
         try:
             v = self.relevance.analyzuj_dokument(obsah) if hasattr(self.relevance, "analyzuj_dokument") \
@@ -1441,20 +1571,62 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
             e(odkaz("/tisk", id="id:%s" % id_tisk)), e(t.nazev), e(text))
 
     @staticmethod
-    def _bunka_etapy(etapa):
-        """Buňka tabulky s koncem etapy (nebo 'probíhá')."""
+    def _bunka_etapy(etapa, doplnek=""):
+        """Buňka tabulky s koncem etapy (nebo 'probíhá'); doplnek = HTML pod datem."""
+        if doplnek:
+            doplnek = "<div class='mensi'>%s</div>" % doplnek
         if not etapa:
-            return "<td></td>"
+            return "<td>%s</td>" % doplnek
         if etapa["probiha"]:
-            return "<td data-razeni='9999'><span class='stitek'>probíhá</span></td>"
+            return "<td data-razeni='9999'><span class='stitek'>probíhá</span>%s</td>" % doplnek
         d = etapa["do"]
-        return "<td data-razeni='%s' title='%s'>%s</td>" % (
+        return "<td data-razeni='%s' title='%s'>%s%s</td>" % (
             e(d.isoformat() if hasattr(d, "isoformat") else ""), e(etapa["akce"]),
-            e(fmt_datum(d.date() if hasattr(d, "date") else d)))
+            e(fmt_datum(d.date() if hasattr(d, "date") else d)), doplnek)
+
+    @staticmethod
+    def _text_lhuty_senatu(l, kratce=False):
+        """Text 30denní lhůty Senátu: 'do 3. 11. 2026 (zbývá 12 dní)'."""
+        if not l:
+            return ""
+        if not l.get("doruceno"):
+            return "odesláno %s, zatím nedoručeno" % fmt_datum(_jako_den(l.get("odeslano"))) \
+                if l.get("odeslano") else ""
+        if l.get("rozhodnuto") or l.get("akce"):
+            if kratce:
+                return ""
+            return "doručeno %s, lhůta do %s; Senát rozhodl%s (%s)" % (
+                fmt_datum(_jako_den(l["doruceno"])), fmt_datum(l["lhuta_do"]),
+                " " + fmt_datum(_jako_den(l["rozhodnuto"])) if l.get("rozhodnuto") else "",
+                l.get("akce") or "")
+        if l.get("zaniklo"):
+            return "" if kratce else "doručeno %s, lhůta do %s; projednávání skončilo koncem volebního období" % (
+                fmt_datum(_jako_den(l["doruceno"])), fmt_datum(l["lhuta_do"]))
+        if not l.get("lhuta_do") or l.get("zbyva_dni") is None:
+            return "doručeno %s" % fmt_datum(_jako_den(l["doruceno"]))
+        n = l["zbyva_dni"]
+        zbyva = ("lhůta uplynula" if n < 0 else "poslední den lhůty" if n == 0 else
+                 "zbývá %d %s" % (n, "den" if n == 1 else "dny" if n < 5 else "dní"))
+        if kratce:
+            return "lhůta do %s (%s)" % (fmt_datum(l["lhuta_do"]), zbyva)
+        return "doručeno %s → lhůta do %s (%s)" % (fmt_datum(_jako_den(l["doruceno"])),
+                                                  fmt_datum(l["lhuta_do"]), zbyva)
+
+    @staticmethod
+    def _senat_kratky(senatni, jen_postoupene=False):
+        """Odkazy na senátní tisky: 'ST 287 (15. FO)' → senat.cz."""
+        vyber = [x for x in senatni if not jen_postoupene or x["typ"] in (20, 21, 30)]
+        return ", ".join(
+            "<a href='%s' target='_blank' rel='noopener' title='%s – %s'>ST %s ↗</a>" % (
+                e(x["url"]), e(x["anotace"] or ""), e(x["stav_nazev"]), e(x["cislo"]))
+            for x in vyber)
 
     @staticmethod
     def _stitek_stavu(t):
-        return "<span class='stitek%s'>%s</span>" % (" konec" if t.projednano else "", e(t.stav or "?"))
+        puvodni = getattr(t, "stav_v_datech", None) if getattr(t, "zanikl_koncem_obdobi", False) else None
+        return "<span class='stitek%s'%s>%s</span>" % (
+            " konec" if t.projednano else "",
+            " title='V datech Sněmovny zůstal stav: %s'" % e(puvodni) if puvodni else "", e(t.stav or "?"))
 
     @staticmethod
     def _bod_kratky(b):
@@ -1478,7 +1650,12 @@ nebo zadejte PID / čj do vyhledávání nahoře.</p>
             for t in zakony:
                 pid = t.pid_eklep
                 etapy = t.etapy()
-                bunky_etap = "".join(self._bunka_etapy(etapy.get(n)) for n in _psp.NAZVY_ETAP)
+                senat = self._senat_kratky(t.senatni_tisky(), jen_postoupene=True) \
+                    if hasattr(t, "senatni_tisky") else ""
+                lhuta = self._text_lhuty_senatu((etapy.get("Senát") or {}).get("lhuta"), kratce=True)
+                senat = "<br>".join(x for x in (lhuta and "<span class='lhuta'>%s</span>" % e(lhuta), senat) if x)
+                bunky_etap = "".join(self._bunka_etapy(etapy.get(n), senat if n == "Senát" else "")
+                                     for n in _psp.NAZVY_ETAP)
                 radky.append((
                     "<tr>" + self._bunka_hvezdy("tisk", t.id_tisk, "Tisk %s – %s" % (t.cislo, t.nazev),
                                                 klice).replace("%", "%%") +
@@ -1526,6 +1703,7 @@ po najetí myší je vidět, jakým krokem etapa skončila.</p>""" % {
         with self._zamek_psp:
             p = self._psp_pro()
             t = p.tisk(ident)
+            senatni = t.senatni_tisky() if hasattr(t, "senatni_tisky") else []
             info = [("Druh", e(t.druh)), ("Navrhovatel", e(t.navrhovatel)),
                     ("Typ navrhovatele", e(t.typ_navrhovatele)),
                     ("Předkladatelé", e(", ".join(x for x in t.predkladatele() if x))),
@@ -1535,6 +1713,9 @@ po najetí myší je vidět, jakým krokem etapa skončila.</p>""" % {
                     ("Lhůta", e(t.lhuta)),
                     ("Aktuální schůze", self._bod_kratky(t.aktualni_bod())),
                     ("Další projednávání", e(fmt_datum(t.dalsi_projednavani))),
+                    ("Senát", self._senat_kratky(senatni)),
+                    ("Lhůta Senátu", e(self._text_lhuty_senatu(t.lhuta_senatu()))
+                     if hasattr(t, "lhuta_senatu") else ""),
                     ("Sbírka zákonů", odkaz_sbirka(t.sbirka)),
                     ("Úplný název", e(t.uplny_nazev))]
             historie = t.historie()
@@ -1565,9 +1746,12 @@ po najetí myší je vidět, jakým krokem etapa skončila.</p>""" % {
         tab_etapy = "<div class='posun'><table class='data'><thead><tr><th>Etapa</th><th>Začátek</th>" \
                     "<th>Konec</th><th>Jak skončila</th></tr></thead><tbody>%s</tbody></table></div>" % "".join(
             "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                e(nazev), e(fmt_datum(x["od"])),
+                e(nazev), e(fmt_datum(x["od"])) + (" <span class='tlumene'>(doručení)</span>"
+                                                   if (x.get("lhuta") or {}).get("doruceno") else ""),
                 "<span class='stitek'>probíhá</span>" if x["probiha"] else e(fmt_datum(x["do"])),
-                e(x["akce"])) for nazev, x in etapy.items()) if etapy else \
+                e(x["akce"]) + ("<div class='lhuta'>%s</div>" % e(self._text_lhuty_senatu(x["lhuta"], kratce=True))
+                                if x.get("lhuta") and x["probiha"] else ""))
+            for nazev, x in etapy.items()) if etapy else \
             "<p class='tlumene'>Tisk zatím neprošel žádnou etapou projednávání.</p>"
 
         tab_hist = "<div class='posun'><table class='data'><thead><tr><th>Datum</th><th>Akce</th>" \
@@ -1605,6 +1789,16 @@ po najetí myší je vidět, jakým krokem etapa skončila.</p>""" % {
                 e(n["druh"]), e(n["nazev"]), e(fmt_datum(n["rozeslano"])), e(n["vysledek"]))
             for n in nasledne) if nasledne else "<p class='tlumene'>Žádné následné tisky.</p>"
 
+        tab_senat = "<div class='posun'><table class='data'><thead><tr><th>Senátní tisk</th><th>Období</th>" \
+                    "<th>Druh</th><th>Stav</th><th>Vazba</th><th>Název</th></tr></thead><tbody>%s</tbody>" \
+                    "</table></div>" % "".join(
+            "<tr><td><a href='%s' target='_blank' rel='noopener'>%s ↗</a></td><td>%s. funkční období</td>"
+            "<td>%s</td><td><span class='stitek'>%s</span></td><td>%s</td><td><b>%s</b><div class='tlumene'>%s"
+            "</div></td></tr>" % (
+                e(x["url"]), e(x["cislo"]), e(x["obdobi"]), e(x["druh"] or ""), e(x["stav_nazev"]),
+                e(x["typ_popis"]), e(x["anotace"] or ""), e(x["nazev"] or ""))
+            for x in senatni) if senatni else "<p class='tlumene'>Tisk zatím nebyl postoupen Senátu.</p>"
+
         odkazy = " · ".join(x for x in (
             "<a href='%s' target='_blank' rel='noopener'>historie na psp.cz ↗</a>" % e(url_psp) if url_psp else "",
             "<a href='%s' target='_blank' rel='noopener'>text tisku ↗</a>" % e(url_text) if url_text else "") if x)
@@ -1616,11 +1810,12 @@ po najetí myší je vidět, jakým krokem etapa skončila.</p>""" % {
 <h2>Legislativní proces</h2>%(hist)s
 <h2>Projednávání na schůzích</h2>%(body)s
 <h2>Výbory</h2>%(vybory)s
-<h2>Následné tisky</h2>%(nasl)s""" % {
+<h2>Následné tisky</h2>%(nasl)s
+<h2>Senát</h2>%(senat)s""" % {
             "nadpis": e(nadpis), "podnadpis": e(podnadpis),
             "hvezda": self.hvezda("tisk", id_tisk, "%s – %s" % (nadpis, nazev)), "nazev": e(nazev), "odkazy": odkazy,
             "info": radky_info, "eklep": tab_eklep, "etapy": tab_etapy, "hist": tab_hist, "body": tab_body,
-            "vybory": tab_vybory, "nasl": tab_nasl}
+            "vybory": tab_vybory, "nasl": tab_nasl, "senat": tab_senat}
         return self._stranka(nadpis, obsah, sekce="tisky")
 
     def stranka_schuze(self, parametry):
@@ -1675,6 +1870,9 @@ po najetí myší je vidět, jakým krokem etapa skončila.</p>""" % {
                      ("Stav", "%s · od %s" % (self._stitek_stavu(t), e(fmt_datum(t.datum_stavu)))),
                      ("Poslední krok", e(t.posledni_krok.akce if t.posledni_krok else "")),
                      ("Schůze", self._bod_kratky(t.aktualni_bod())),
+                     ("Senát", self._senat_kratky(t.senatni_tisky()) if hasattr(t, "senatni_tisky") else ""),
+                     ("Lhůta Senátu", e(self._text_lhuty_senatu(t.lhuta_senatu()))
+                      if hasattr(t, "lhuta_senatu") else ""),
                      ("Sbírka zákonů", odkaz_sbirka(t.sbirka)),
                      ("Čj OVA", e(vazba["cj_ova"]) if vazba else "")]
             if vazba and vazba["nasledny"]:
@@ -1682,6 +1880,94 @@ po najetí myší je vidět, jakým krokem etapa skončila.</p>""" % {
                                  % e(vazba["tisk"])))
         return "<div class='karta'><table class='kv'>%s</table></div>" % "".join(
             "<tr><th>%s</th><td>%s</td></tr>" % (k, v) for k, v in radky if v)
+
+    # ---------------- index čísel jednacích připomínek ----------------
+    # Čj připomínkových míst nejsou v datové sadě ODOK, jen v JSONu připomínek každého materiálu.
+    # Kvůli šetření přenosu se nic navíc nestahuje: index se skládá jen z připomínek, které už
+    # jsou v cache (materiály, u kterých se připomínky někdy zobrazily), a doplňuje se průběžně.
+
+    @staticmethod
+    def _norm_cj(text):
+        return re.sub(r"[^A-Z0-9]", "", _odok.bez_diakritiky(text or "").upper())
+
+    def _pridej_do_indexu(self, pid, data):
+        zaznamy = []
+        for r in (data.get("reviews_list") or []) if isinstance(data, dict) else []:
+            cj = ((r.get("identifier") or {}).get("id_no_ext") or "").strip()
+            if not cj:
+                continue
+            org = (r.get("author") or {}).get("organization") or {}
+            zaznamy.append((self._norm_cj(cj), {"pid": pid, "cj": cj, "org": org.get("id") or "",
+                                                "org_nazev": org.get("name") or "",
+                                                "typ": (r.get("review_type") or {}).get("name") or ""}))
+        with self._zamek_indexu:
+            for klic in [k for k, v in self._index_cj.items() if any(x["pid"] == pid for x in v)]:
+                self._index_cj[klic] = [x for x in self._index_cj[klic] if x["pid"] != pid]
+            for klic, z in zaznamy:
+                if klic:
+                    self._index_cj.setdefault(klic, []).append(z)
+            self._index_pid.add(pid)
+
+    def indexuj_pripominky_na_pozadi(self):
+        if getattr(self, "_index_bezi", False):
+            return
+        self._index_bezi = True
+        threading.Thread(target=self._indexuj_pripominky, daemon=True).start()
+
+    def _indexuj_pripominky(self):
+        import json as _json
+        import glob
+        try:
+            # už stažené soubory připomínek (nic se nestahuje)
+            for cesta in glob.glob(os.path.join(self.odok.cache_dir, "pripominky_*.json")):
+                pid = os.path.basename(cesta)[11:-5]
+                try:
+                    with open(cesta, encoding="utf-8-sig") as f:
+                        self._pridej_do_indexu(pid, _json.load(f))
+                except (OSError, ValueError):
+                    continue
+        except Exception as chyba:  # noqa: BLE001 – index je jen pomůcka
+            sys.stderr.write("Index čj připomínek: %s\n" % chyba)
+        finally:
+            self._index_bezi = False
+            self._index_dokoncen = time.time()
+
+    def hledej_cj_pripominek(self, dotaz, jen_presne=False):
+        """Připomínky, jejichž čj odpovídá dotazu (bez ohledu na mezery, pomlčky a diakritiku)."""
+        q = self._norm_cj(dotaz)
+        if len(q) < 5 or not re.search(r"\d", q):
+            return []
+        with self._zamek_indexu:
+            nalezy = list(self._index_cj.get(q, []))
+            if not nalezy and not jen_presne:
+                for klic, v in self._index_cj.items():
+                    if q in klic:
+                        nalezy.extend(v)
+                        if len(nalezy) > 50:
+                            break
+        return nalezy
+
+    def _html_nalezy_pripominek(self, q):
+        nalezy = self.hledej_cj_pripominek(q)
+        stav = ("<p class='tlumene'>Čísla jednací připomínek se prohledávají jen u materiálů, jejichž "
+                "připomínky už byly v aplikaci zobrazeny (%d materiálů).</p>" % len(self._index_pid))
+        if not nalezy:
+            return ""
+        radky = []
+        for n in nalezy:
+            try:
+                with self._zamek_dat:
+                    m = self._najdi_material(n["pid"])
+                nazev = m.nazev or n["pid"]
+            except OdokChyba:
+                nazev = n["pid"]
+            radky.append("<tr><td><a href='%s'>%s</a></td><td><b>%s</b> <span class='tlumene'>%s</span></td>"
+                         "<td>%s</td><td>%s</td></tr>" % (
+                             e(odkaz("/material", id=n["pid"])), e(nazev), e(n["org"]), e(n["org_nazev"]),
+                             e(n["cj"]), e(n["typ"])))
+        return ("<h2>Nalezeno v číslech jednacích připomínek</h2><div class='posun'><table class='data raditelna'>"
+                "<thead><tr><th>Materiál</th><th>Připomínkové místo</th><th>Čj připomínky</th><th>Typ</th></tr>"
+                "</thead><tbody>%s</tbody></table></div>%s<h2>Materiály</h2>" % ("".join(radky), stav))
 
     # ---------------- Oblíbené ⭐ ----------------
 
@@ -1766,6 +2052,8 @@ po najetí myší je vidět, jakým krokem etapa skončila.</p>""" % {
             etapy = t.etapy()
             probiha = next((_psp.NAZVY_ETAP[n] if isinstance(_psp.NAZVY_ETAP, dict) else n
                             for n in _psp.NAZVY_ETAP if (etapy.get(n) or {}).get("probiha")), "")
+            if probiha == "Senát":
+                probiha += " – " + self._text_lhuty_senatu((etapy.get("Senát") or {}).get("lhuta"), kratce=True)
             r.update(nazev=t.nazev, stav=self._stitek_stavu(t), od=t.datum_stavu, etapa=probiha,
                      sbirka=t.sbirka or "", pid=t.pid_eklep or "",
                      odkaz="<a href='%s'>%s</a>%s" % (

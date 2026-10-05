@@ -102,11 +102,7 @@
       return vzestupne ? c : -c;
     });
     var tb = this.tbody;
-    tb.querySelectorAll('tr.relevance-radek').forEach(function (r) {
-      var b = r.previousElementSibling && r.previousElementSibling.querySelector('button[data-relevance]');
-      if (b) b.textContent = 'Provést analýzu relevance';
-      r.remove();
-    });
+    tb.querySelectorAll('tr.relevance-radek').forEach(function (r) { zrusVlozenyRadek(r); });
     this.radky.forEach(function (r) { tb.appendChild(r); });
     this.strana = 0;
     this.vykresli();
@@ -130,6 +126,7 @@
     viditelne.slice(od, po).forEach(function (r) { r.style.display = ''; });
     this.tbody.querySelectorAll('tr.relevance-radek').forEach(function (r) {
       var pred = r.previousElementSibling;
+      while (pred && pred.classList.contains('relevance-radek')) pred = pred.previousElementSibling;
       r.style.display = pred ? pred.style.display : '';
     });
     this.ovladani.forEach(function (div) { self.vykresliOvladani(div, n, od, po, stran); });
@@ -207,37 +204,54 @@
       .then(function () { location.reload(); })
       .catch(function (err) { alert('Nepodařilo se uložit: ' + err); });
   });
+  // ---------- řádek vložený pod řádek tabulky (náhled dokumentu, analýza relevance) ----------
+  // Tlačítko data-vlozit="URL" načte HTML z URL do nového řádku pod svým řádkem;
+  // druhé kliknutí řádek zase skryje. data-skryt / data-nacitam = texty tlačítka a načítání.
+  function zrusVlozenyRadek(r) {
+    var b = r._tlacitko;
+    if (b && b.dataset.puvodni) b.textContent = b.dataset.puvodni;
+    r.remove();
+  }
+  function nactiDoRadku(td, url) {
+    return fetch(url).then(function (r) { return r.text(); })
+      .then(function (t) { td.innerHTML = t; inicializuj(td); })
+      .catch(function (err) { td.innerHTML = '<div class="chyba">' + err + '</div>'; });
+  }
   document.addEventListener('click', function (ev) {
-    var b = ev.target.closest('button[data-relevance]');
+    var b = ev.target.closest('button[data-vlozit]');
     if (!b) return;
     var tr = b.closest('tr');
-    var dalsi = tr.nextElementSibling;
-    if (dalsi && dalsi.classList.contains('relevance-radek')) { dalsi.remove(); b.textContent = 'Provést analýzu relevance'; return; }
+    if (!tr) return;
+    var url = b.dataset.vlozit;
+    // už vložený řádek od tohoto tlačítka → skrýt
+    var r = tr.nextElementSibling, posledni = tr;
+    while (r && r.classList.contains('relevance-radek')) {
+      if (r.dataset.zdroj === url) { zrusVlozenyRadek(r); return; }
+      posledni = r; r = r.nextElementSibling;
+    }
+    if (!b.dataset.puvodni) b.dataset.puvodni = b.textContent;
     var novy = document.createElement('tr');
     novy.className = 'relevance-radek';
+    novy.dataset.zdroj = url;
+    novy._tlacitko = b;
     var td = document.createElement('td');
     td.colSpan = tr.cells.length;
-    td.innerHTML = '<p class="nacitam">Stahuji dokument a hledám výrazy…</p>';
+    td.innerHTML = '<p class="nacitam">' + (b.dataset.nacitam || 'Načítám…') + '</p>';
     novy.appendChild(td);
-    tr.insertAdjacentElement('afterend', novy);
+    posledni.insertAdjacentElement('afterend', novy);
     b.disabled = true;
-    fetch(b.dataset.relevance).then(function (r) { return r.text(); })
-      .then(function (t) { td.innerHTML = t; inicializuj(td); b.textContent = 'Skrýt analýzu'; })
-      .catch(function (err) { td.innerHTML = '<div class="chyba">' + err + '</div>'; })
-      .then(function () { b.disabled = false; });
+    nactiDoRadku(td, url).then(function () {
+      b.disabled = false;
+      if (b.dataset.skryt) b.textContent = b.dataset.skryt;
+    });
   });
   document.addEventListener('click', function (ev) {
     var b = ev.target.closest('button[data-relevance-znovu]');
     if (!b) return;
     var radek = b.closest('tr.relevance-radek');
-    var puvodni = radek && radek.previousElementSibling &&
-      radek.previousElementSibling.querySelector('button[data-relevance]');
-    if (!puvodni) return;
-    var td = radek.cells[0];
+    if (!radek || !radek.dataset.zdroj) return;
     b.disabled = true; b.textContent = 'Přegenerovávám…';
-    fetch(puvodni.dataset.relevance).then(function (r) { return r.text(); })
-      .then(function (t) { td.innerHTML = t; inicializuj(td); })
-      .catch(function (err) { td.innerHTML = '<div class="chyba">' + err + '</div>'; });
+    nactiDoRadku(radek.cells[0], radek.dataset.zdroj);
   });
   document.addEventListener('change', function (ev) {
     var v = ev.target;

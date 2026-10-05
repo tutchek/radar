@@ -7,7 +7,7 @@ spojuje otevřená data:
 
 - **ODOK / eKLEP** – materiály vlády, jejich verze, připomínkové řízení a dokumenty,
 - **e-Legislativa (eSeL)** – fáze a stavy podzákonných předpisů, číslo ve Sbírce, účinnost,
-- **Poslanecká sněmovna** – sněmovní tisky, jejich stav, čtení a schůze.
+- **Poslanecká sněmovna a Senát** – sněmovní tisky, jejich stav, čtení a schůze, navázané senátní tisky.
 
 Aplikace běží na vašem počítači, data stahuje z veřejných zdrojů a zobrazuje je v prohlížeči
 na `http://localhost:8765/`. Potřebuje jen Python, žádné další knihovny.
@@ -21,7 +21,8 @@ na `http://localhost:8765/`. Potřebuje jen Python, žádné další knihovny.
   s dokumenty, historickými verzemi (MPŘ → PK → JV → PV) a přehledem připomínek
   (zásadní / doporučující / bez připomínek, kdo se nevyjádřil).
 - **Sněmovní tisky** – stav tisku, data ukončení 1. čtení, garančního výboru, 2. a 3. čtení
-  a Senátu, pořady schůzí, následné tisky s odkazy na psp.cz, vazba na materiál v eKLEPu.
+  a Senátu, pořady schůzí, následné tisky s odkazy na psp.cz, vazba na materiál v eKLEPu,
+  senátní tisky (číslo, stav, proklik na senat.cz).
 - **e-Legislativa** – k vyhláškám a nařízením vlády fáze a stavy procesu, číslo ve Sbírce
   (s proklikem do e-Sbírky) a účinnost; odkazy na veřejný portál i pracovní e-Legislativu.
 - **Podklady PLPV** – tabulky ve struktuře excelu Plánu legislativních prací vlády
@@ -95,7 +96,7 @@ uplynutí platnosti. Při výpadku sítě se použije i starší kopie.
 | ODOK – datové sady po ročnících | `https://www.odok.cz/opendata/dataset/odok/` | `%TEMP%\odok_cache` | 2 h |
 | ODOK – verze a připomínky materiálu | `https://www.odok.gov.cz/portal/veklep/material/…/json` | `%TEMP%\odok_cache` | 2 h |
 | Dokumenty pro analýzu relevance | `https://www.odok.cz/portal/services/download/attachment/…` | `%TEMP%\odok_cache` | bez omezení (dokumenty se nemění) |
-| Poslanecká sněmovna | `https://www.psp.cz/eknih/cdrom/opendata/` (tisky, schuze, poslanci) | `%TEMP%\psp_cache` | 2 h |
+| Poslanecká sněmovna a Senát | `https://www.psp.cz/eknih/cdrom/opendata/` (tisky, schuze, poslanci, se_tisk) | `%TEMP%\psp_cache` | 2 h |
 | e-Legislativa | `https://opendata.eselpoint.gov.cz/datove-sady-elegislativa/` | `%TEMP%\esel_cache` | 12 h |
 
 Běžící aplikace prošlá data obnovuje sama; tlačítko **Obnovit data** stáhne vše hned.
@@ -143,7 +144,7 @@ Z příkazové řádky: `py relevance.py dokument.docx` (také `.doc` a `.pdf`).
 | `relevance.py` | analýza relevance dokumentů pro útvary (Word .docx/.doc, PDF přes pdftext.py) |
 | `pdftext.py` | čtení textu z PDF (jen standardní knihovna) |
 | `relevance_pravidla_vzor.xlsx` | vzor seznamu výrazů pro analýzu relevance (vlastní seznam se z něj založí při prvním použití) |
-| `odok_analyza.py`, `psp_analyza.py`, `esel_analyza.py`, `esel_vazby.py` | diagnostika struktury zdrojových dat |
+| `odok_analyza.py`, `psp_analyza.py`, `senat_analyza.py`, `esel_analyza.py`, `esel_vazby.py` | diagnostika struktury zdrojových dat |
 
 Moduly `psp.py`, `esel.py`, `plpv.py`, `relevance.py` a `pdftext.py` jsou volitelné –
 když některý chybí, aplikace běží bez příslušné části.

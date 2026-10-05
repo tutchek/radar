@@ -36,9 +36,9 @@ import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
 
-__version__ = "1.3"
+__version__ = "1.4"
 __all__ = ["Relevance", "RelevanceChyba", "nacti_docx", "nacti_doc", "nacti_dokument",
-           "VYCHOZI_PRAVIDLA", "VZOR_PRAVIDEL"]
+           "VYCHOZI_PRAVIDLA", "VZOR_PRAVIDEL", "dokument_na_html"]
 
 VYCHOZI_PRAVIDLA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relevance_pravidla.xlsx")
 # vzor dodávaný s programem – při aktualizaci se přepisuje, proto se do něj nepíše;
@@ -117,6 +117,157 @@ def nacti_docx(zdroj):
     except zipfile.BadZipFile:
         raise RelevanceChyba("Soubor není ve formátu .docx (starý .doc nebo PDF analyzovat neumím).")
     return "\n".join(odstavce)
+
+
+# ================================================================ náhled (HTML)
+
+import html as _html
+
+_ATRIBUT_VAL = W + "val"
+
+
+def _zapnuto(el):
+    """w:b / w:i bez val, nebo s val jiným než 0/false = zapnuto."""
+    return el is not None and (el.get(_ATRIBUT_VAL) or "1") not in ("0", "false", "off")
+
+
+def _odstavec_html(p, styly):
+    """Odstavec .docx → (html, je_nadpis, je_seznam). Tučné a kurzíva zachová."""
+    kusy = []
+
+    def projdi(el, tucne=False, kurziva=False):
+        for ch in el:
+            if ch.tag == MC_FALLBACK or ch.tag == W + "del" or ch.tag == W + "pPr":
+                continue
+            if ch.tag == W + "r":
+                rpr = ch.find(W + "rPr")
+                b = _zapnuto(rpr.find(W + "b")) if rpr is not None else False
+                i = _zapnuto(rpr.find(W + "i")) if rpr is not None else False
+                for x in ch:
+                    if x.tag == W + "t" and x.text:
+                        kusy.append((x.text, b or tucne, i or kurziva))
+                    elif x.tag == W + "tab":
+                        kusy.append(("\t", False, False))
+                    elif x.tag in (W + "br", W + "cr"):
+                        kusy.append(("\n", False, False))
+            else:
+                projdi(ch, tucne, kurziva)
+
+    projdi(p)
+    vystup, posledni = [], None
+    for text, b, i in kusy:
+        t = _html.escape(text).replace("\n", "<br>")
+        znacka = ("b" if b else "") + ("i" if i else "")
+        if vystup and znacka == posledni:
+            vystup[-1][1].append(t)
+        else:
+            vystup.append((znacka, [t]))
+        posledni = znacka
+    obsah = ""
+    for znacka, texty in vystup:
+        t = "".join(texty)
+        if "i" in znacka:
+            t = "<i>%s</i>" % t
+        if "b" in znacka:
+            t = "<b>%s</b>" % t
+        obsah += t
+    ppr = p.find(W + "pPr")
+    styl = ""
+    seznam = False
+    if ppr is not None:
+        ps = ppr.find(W + "pStyle")
+        if ps is not None:
+            styl = styly.get(ps.get(_ATRIBUT_VAL), ps.get(_ATRIBUT_VAL) or "")
+        seznam = ppr.find(W + "numPr") is not None or bool(
+            re.match(r"(list|seznam|odrážk|odrazk)", styl or "", re.I))
+    nadpis = bool(re.match(r"(heading|nadpis|title|název)", styl or "", re.I))
+    return obsah, nadpis, seznam
+
+
+def _blok_html(el, styly, vystup):
+    """Prvky těla dokumentu (odstavce, tabulky, obsahové bloky) → HTML do seznamu vystup."""
+    seznam = []
+
+    def uzavri_seznam():
+        if seznam:
+            vystup.append("<ul>%s</ul>" % "".join("<li>%s</li>" % x for x in seznam))
+            del seznam[:]
+
+    for ch in el:
+        if ch.tag == W + "p":
+            obsah, nadpis, je_seznam = _odstavec_html(ch, styly)
+            if not obsah.strip():
+                uzavri_seznam()
+                continue
+            if je_seznam:
+                seznam.append(obsah)
+                continue
+            uzavri_seznam()
+            vystup.append(("<h4>%s</h4>" if nadpis else "<p>%s</p>") % obsah)
+        elif ch.tag == W + "tbl":
+            uzavri_seznam()
+            radky = []
+            for tr in ch.findall(W + "tr"):
+                bunky = []
+                for tc in tr.findall(W + "tc"):
+                    tcpr = tc.find(W + "tcPr")
+                    span = 1
+                    if tcpr is not None:
+                        gs = tcpr.find(W + "gridSpan")
+                        if gs is not None and (gs.get(_ATRIBUT_VAL) or "").isdigit():
+                            span = int(gs.get(_ATRIBUT_VAL))
+                        vm = tcpr.find(W + "vMerge")
+                        if vm is not None and vm.get(_ATRIBUT_VAL) != "restart":
+                            bunky.append("<td class='slouceno'%s></td>" % (
+                                " colspan='%d'" % span if span > 1 else ""))
+                            continue
+                    obsah = []
+                    _blok_html(tc, styly, obsah)
+                    bunky.append("<td%s>%s</td>" % (" colspan='%d'" % span if span > 1 else "",
+                                                    "".join(obsah)))
+                radky.append("<tr>%s</tr>" % "".join(bunky))
+            vystup.append("<div class='posun'><table class='dokument'>%s</table></div>" % "".join(radky))
+        elif ch.tag == MC_FALLBACK:
+            continue
+        elif ch.tag in (W + "sdt", W + "sdtContent", W + "customXml", W + "body"):
+            uzavri_seznam()
+            _blok_html(ch, styly, vystup)
+    uzavri_seznam()
+
+
+def docx_na_html(zdroj):
+    """Obsah .docx jako jednoduché HTML: odstavce, nadpisy, odrážky, tučné/kurzíva, tabulky."""
+    try:
+        with zipfile.ZipFile(zdroj) as z:
+            jmena = z.namelist()
+            styly = {}
+            if "word/styles.xml" in jmena:
+                for st in ET.fromstring(z.read("word/styles.xml")).iter(W + "style"):
+                    nazev = st.find(W + "name")
+                    if nazev is not None:
+                        styly[st.get(W + "styleId")] = nazev.get(_ATRIBUT_VAL) or ""
+            dokument = ET.fromstring(z.read("word/document.xml"))
+    except (zipfile.BadZipFile, KeyError, ET.ParseError):
+        raise RelevanceChyba("Soubor se nepodařilo přečíst jako dokument Word (.docx).")
+    vystup = []
+    telo = dokument.find(W + "body")
+    if telo is not None:
+        _blok_html(telo, styly, vystup)
+    return "".join(vystup)
+
+
+def text_na_html(text):
+    """Prostý text (z .doc nebo PDF) → odstavce; tabulátory (buňky tabulek .doc) jako mezery."""
+    odstavce = [o.strip() for o in re.split(r"\n\s*\n|\n", text or "")]
+    return "".join("<p>%s</p>" % _html.escape(re.sub(r"[ \t]{2,}|\t", "   ", o)) for o in odstavce if o)
+
+
+def dokument_na_html(data):
+    """Náhled dokumentu (bytes) jako HTML – .docx se strukturou, .doc a PDF jako text."""
+    if data[:2] == b"PK":
+        import io
+        return docx_na_html(io.BytesIO(data))
+    return text_na_html(nacti_dokument(data))
 
 
 # ================================================================ starý Word (.doc)
