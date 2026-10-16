@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<!-- Kostra každé stránky Legislativního radaru (proměnné se zapisují se znakem dolaru: titulek, nav, prepinac, obsah, verze, uzivatel, csrf, obnovit, zpravy). -->
+<html lang="cs"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf" content="$csrf">
+<title>$titulek – Legislativní radar</title>
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+<link rel="stylesheet" href="assets/styl.css?v=$verze">
+</head>
+<body><header>
+<a class="logo" href="index.php" title="Legislativní radar – ODOK, e-Legislativa a Sněmovna na jednom místě"><span class="znak">§</span> Legislativní radar</a>
+<nav>$nav</nav>
+$prepinac
+<form action="index.php"><input type="hidden" name="p" value="hledej"><input type="search" name="q" placeholder="PID, čj, číslo tisku, předpis (280/2009) nebo text…" required>
+<button>Hledat</button></form>
+$obnovit
+$uzivatel
+</header>
+<main>$zpravy$obsah</main>
+<script src="assets/skript.js?v=$verze"></script>
+</body></html>

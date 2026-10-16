@@ -1,0 +1,4 @@
+# zámek Excelu při otevřeném seznamu výrazů
+~$*.xlsx
+# vlastní seznam výrazů pro analýzu relevance (v repozitáři je jen vzor)
+relevance_pravidla.xlsx

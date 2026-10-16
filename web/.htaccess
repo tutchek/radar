@@ -1,0 +1,11 @@
+# Legislativní radar – Apache: výchozí stránka a zákaz přístupu k interním souborům
+DirectoryIndex index.php
+Options -Indexes
+<FilesMatch "^(config\.php|config\.sample\.php|README\.md|LICENSE|.*\.xlsx|.*\.sql|install\.lock)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Deny from all
+    </IfModule>
+</FilesMatch>
